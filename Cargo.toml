@@ -1,0 +1,24 @@
+[package]
+name = "efisigner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUI / TUI
+ratatui = "0.26"
+crossterm = "0.27"
+
+# Cryptography
+argon2 = "0.5"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+sha3 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+# Utils
+chrono = "0.4"
+anyhow = "1.0"
+walkdir = "2"
+
