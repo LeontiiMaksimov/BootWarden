@@ -32,6 +32,14 @@ const UUID_FILENAME: &str = "uuid.aes";
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
+/// Cached key material so we only run Argon2 once (at login).
+/// The salt is kept so we can re-encrypt files with the same KDF output.
+#[derive(Clone)]
+struct DerivedKeys {
+    key: [u8; 32],
+    salt: [u8; SALT_LEN],
+}
+
 #[derive(Clone, PartialEq)]
 enum AppMode {
     Dashboard,
@@ -79,6 +87,14 @@ enum WorkerMessage {
     Result(String, String),
     Error(String, String),
     AllFinished,
+    UnlockOk(
+        Vec<String>,
+        HashMap<String, (String, String)>,
+        Option<String>,
+        DerivedKeys,
+    ),
+    UnlockErr(String),
+    SaveDone(std::result::Result<String, String>),
 }
 
 fn main() -> Result<()> {
@@ -100,12 +116,15 @@ fn run_tui_app() -> Result<()> {
 
     let mut results: Vec<DeviceResult> = Vec::new();
     let mut db_map: HashMap<String, (String, String)> = HashMap::new();
+    let mut cached_keys: Option<DerivedKeys> = None;
 
     let mut manage_list: Vec<SystemBlockDevice> = Vec::new();
     let mut manage_state = ListState::default();
 
     let (tx, rx): (Sender<WorkerMessage>, Receiver<WorkerMessage>) = mpsc::channel();
     let mut is_verifying = false;
+    let mut is_unlocking = false;
+    let mut is_saving = false;
 
     loop {
         terminal.draw(|f| {
@@ -150,10 +169,56 @@ fn run_tui_app() -> Result<()> {
                 }
                 WorkerMessage::AllFinished => {
                     is_verifying = false;
-                    match save_encrypted_db(&db_map, &password) {
-                        Ok(_) => status_msg = "Verification Complete. DB Saved.".to_string(),
-                        Err(e) => {
-                            status_msg = format!("Error saving DB: {}", e);
+                    // Save DB in background to avoid freezing
+                    if let Some(ref keys) = cached_keys {
+                        is_saving = true;
+                        let keys_c = keys.clone();
+                        let db_c = db_map.clone();
+                        let tx_c = tx.clone();
+                        thread::spawn(move || {
+                            let res = save_encrypted_db_with_key(&db_c, &keys_c);
+                            let _ = tx_c.send(WorkerMessage::SaveDone(match res {
+                                Ok(_) => Ok("Verification Complete. DB Saved.".to_string()),
+                                Err(e) => Err(format!("Error saving DB: {}", e)),
+                            }));
+                        });
+                    } else {
+                        status_msg = "Verification Complete (no key to save DB).".to_string();
+                    }
+                }
+                WorkerMessage::UnlockOk(loaded_uuids, loaded_db, warning, keys) => {
+                    is_unlocking = false;
+                    unlocked = true;
+                    db_map = loaded_db;
+                    cached_keys = Some(keys);
+                    results = rebuild_results(&loaded_uuids, &db_map);
+
+                    if let Some(w) = warning {
+                        status_msg = w;
+                        status_color = Color::Yellow;
+                    } else if Path::new(UUID_FILENAME).exists() {
+                        status_msg = "Ready.".to_string();
+                        status_color = Color::Green;
+                    } else {
+                        status_msg = "New Session. Press 'm' to add UUIDs.".to_string();
+                        status_color = Color::Green;
+                    }
+                }
+                WorkerMessage::UnlockErr(e) => {
+                    is_unlocking = false;
+                    status_msg = format!("Failed: {}", e);
+                    status_color = Color::Red;
+                    password.clear();
+                }
+                WorkerMessage::SaveDone(result) => {
+                    is_saving = false;
+                    match result {
+                        Ok(msg) => {
+                            status_msg = msg;
+                            status_color = Color::Green;
+                        }
+                        Err(msg) => {
+                            status_msg = msg;
                             status_color = Color::Red;
                         }
                     }
@@ -166,35 +231,25 @@ fn run_tui_app() -> Result<()> {
                 if !unlocked {
                     match key.code {
                         KeyCode::Enter => {
-                            status_msg = "Decrypting...".to_string();
-                            status_color = Color::Yellow;
-                            terminal
-                                .draw(|f| draw_login(f, &password, &status_msg, status_color))?;
-
-                            match perform_unlock_and_load(&password) {
-                                Ok((loaded_uuids, loaded_db, warning)) => {
-                                    unlocked = true;
-                                    db_map = loaded_db;
-                                    results = rebuild_results(&loaded_uuids, &db_map);
-
-                                    if let Some(w) = warning {
-                                        status_msg = w;
-                                        status_color = Color::Yellow;
-                                    } else {
-                                        if Path::new(UUID_FILENAME).exists() {
-                                            status_msg = "Ready.".to_string();
-                                        } else {
-                                            status_msg =
-                                                "New Session. Press 'm' to add UUIDs.".to_string();
+                            if !is_unlocking {
+                                is_unlocking = true;
+                                status_msg = "Decrypting...".to_string();
+                                status_color = Color::Yellow;
+                                let tx_c = tx.clone();
+                                let pass_c = password.clone();
+                                thread::spawn(move || {
+                                    match perform_unlock_and_load(&pass_c) {
+                                        Ok((uuids, db, warning, keys)) => {
+                                            let _ = tx_c.send(WorkerMessage::UnlockOk(
+                                                uuids, db, warning, keys,
+                                            ));
                                         }
-                                        status_color = Color::Green;
+                                        Err(e) => {
+                                            let _ = tx_c
+                                                .send(WorkerMessage::UnlockErr(e.to_string()));
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    status_msg = format!("Failed: {}", e);
-                                    status_color = Color::Red;
-                                    password.clear();
-                                }
+                                });
                             }
                         }
                         KeyCode::Char(c) => password.push(c),
@@ -208,8 +263,12 @@ fn run_tui_app() -> Result<()> {
                     match mode {
                         AppMode::Dashboard => match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => {
-                                if is_verifying {
-                                    status_msg = "Hashing in progress...".to_string();
+                                if is_verifying || is_saving {
+                                    status_msg = if is_verifying {
+                                        "Hashing in progress...".to_string()
+                                    } else {
+                                        "Saving in progress...".to_string()
+                                    };
                                     status_color = Color::Red;
                                 } else {
                                     break;
@@ -247,27 +306,43 @@ fn run_tui_app() -> Result<()> {
                                     .collect();
 
                                 db_map.retain(|k, _| tracked_uuids.contains(k));
-
-                                let content = tracked_uuids.join("\n");
-                                if let Err(e) = save_to_encrypted_file(
-                                    UUID_FILENAME,
-                                    content.as_bytes(),
-                                    &password,
-                                ) {
-                                    status_msg = format!("Error saving UUIDs: {}", e);
-                                    status_color = Color::Red;
-                                } else {
-                                    if let Err(e) = save_encrypted_db(&db_map, &password) {
-                                        status_msg = format!("Error saving DB: {}", e);
-                                        status_color = Color::Red;
-                                    } else {
-                                        status_msg = "List Updated & DB Pruned.".to_string();
-                                        status_color = Color::Green;
-                                    }
-
-                                    results = rebuild_results(&tracked_uuids, &db_map);
-                                }
+                                results = rebuild_results(&tracked_uuids, &db_map);
                                 mode = AppMode::Dashboard;
+
+                                // Save in background using cached key (no Argon2)
+                                if let Some(ref keys) = cached_keys {
+                                    is_saving = true;
+                                    status_msg = "Saving...".to_string();
+                                    status_color = Color::Yellow;
+                                    let keys_c = keys.clone();
+                                    let db_c = db_map.clone();
+                                    let uuids_content =
+                                        tracked_uuids.join("\n");
+                                    let tx_c = tx.clone();
+                                    thread::spawn(move || {
+                                        let uuid_res = save_to_encrypted_file_with_key(
+                                            UUID_FILENAME,
+                                            uuids_content.as_bytes(),
+                                            &keys_c,
+                                        );
+                                        if let Err(e) = uuid_res {
+                                            let _ = tx_c.send(WorkerMessage::SaveDone(Err(
+                                                format!("Error saving UUIDs: {}", e),
+                                            )));
+                                            return;
+                                        }
+                                        let db_res =
+                                            save_encrypted_db_with_key(&db_c, &keys_c);
+                                        let _ = tx_c.send(WorkerMessage::SaveDone(match db_res {
+                                            Ok(_) => {
+                                                Ok("List Updated & DB Pruned.".to_string())
+                                            }
+                                            Err(e) => {
+                                                Err(format!("Error saving DB: {}", e))
+                                            }
+                                        }));
+                                    });
+                                }
                             }
                             KeyCode::Down => {
                                 let i = match manage_state.selected() {
@@ -769,12 +844,28 @@ fn perform_unlock_and_load(
     Vec<String>,
     HashMap<String, (String, String)>,
     Option<String>,
+    DerivedKeys,
 )> {
     if !Path::new(UUID_FILENAME).exists() {
-        return Ok((Vec::new(), HashMap::new(), None));
+        // First run — derive a fresh key so saves work later
+        let mut salt = [0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        let key = derive_key(password, &salt)?;
+        return Ok((Vec::new(), HashMap::new(), None, DerivedKeys { key, salt }));
     }
 
-    let uuids_bytes = load_encrypted_file(UUID_FILENAME, password)
+    // Read the UUID file to get the salt, derive the key once
+    let raw = std::fs::read(UUID_FILENAME)?;
+    if raw.len() < SALT_LEN + IV_LEN {
+        return Err(anyhow::anyhow!("UUID file too short"));
+    }
+    let salt: [u8; SALT_LEN] = raw[..SALT_LEN].try_into().unwrap();
+    let key = derive_key(password, &salt)
+        .context("Invalid Password or Corrupt UUID file")?;
+    let cached = DerivedKeys { key, salt };
+
+    // Now decrypt using the already-derived key (no second Argon2 call)
+    let uuids_bytes = load_encrypted_file_with_key(UUID_FILENAME, &cached)
         .context("Invalid Password or Corrupt UUID file")?;
     let uuid_list: Vec<String> = String::from_utf8(uuids_bytes)?
         .lines()
@@ -786,7 +877,7 @@ fn perform_unlock_and_load(
     let mut warning = None;
 
     if Path::new(DB_FILENAME).exists() {
-        match load_encrypted_file(DB_FILENAME, password) {
+        match load_encrypted_file_with_key(DB_FILENAME, &cached) {
             Ok(bytes) => {
                 let content = String::from_utf8(bytes)?;
                 for line in content.lines() {
@@ -805,18 +896,22 @@ fn perform_unlock_and_load(
             }
         }
     }
-    Ok((uuid_list, db_map, warning))
+    Ok((uuid_list, db_map, warning, cached))
 }
 
-fn load_encrypted_file(path: &str, password: &str) -> Result<Vec<u8>> {
+/// Decrypt a file using the cached derived key.
+/// File format: salt(16) || iv(16) || ciphertext
+/// We re-derive the key from the file's own salt so files encrypted with
+/// different salts (e.g. from a previous session) still work.
+fn load_encrypted_file_with_key(path: &str, keys: &DerivedKeys) -> Result<Vec<u8>> {
     let data = std::fs::read(path)?;
     if data.len() < SALT_LEN + IV_LEN {
         return Err(anyhow::anyhow!("File too short"));
     }
-    let (salt, rest) = data.split_at(SALT_LEN);
+    let (_salt, rest) = data.split_at(SALT_LEN);
     let (iv, ciphertext) = rest.split_at(IV_LEN);
-    let key = derive_key(password, salt)?;
-    let cipher = Aes256CbcDec::new(&key.into(), iv.into());
+    // Use the cached key directly (salt was already used to derive it at login)
+    let cipher = Aes256CbcDec::new(&keys.key.into(), iv.into());
     let mut buf = ciphertext.to_vec();
     let plaintext = cipher
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
@@ -824,31 +919,33 @@ fn load_encrypted_file(path: &str, password: &str) -> Result<Vec<u8>> {
     Ok(plaintext.to_vec())
 }
 
-fn save_to_encrypted_file(path: &str, data: &[u8], password: &str) -> Result<()> {
-    let mut salt = [0u8; SALT_LEN];
+/// Encrypt and save a file using the cached key. Fresh IV each time for
+/// AES-CBC security, but reuses the KDF salt so no Argon2 needed.
+fn save_to_encrypted_file_with_key(path: &str, data: &[u8], keys: &DerivedKeys) -> Result<()> {
     let mut iv = [0u8; IV_LEN];
-    OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut iv);
-    let key = derive_key(password, &salt)?;
-    let cipher = Aes256CbcEnc::new(&key.into(), &iv.into());
+    let cipher = Aes256CbcEnc::new(&keys.key.into(), &iv.into());
     let mut buf = vec![0u8; data.len() + 16];
     buf[..data.len()].copy_from_slice(data);
     let ciphertext = cipher
         .encrypt_padded_mut::<Pkcs7>(&mut buf, data.len())
         .map_err(|e| anyhow::anyhow!("Encrypt Error: {}", e))?;
     let mut file = File::create(path)?;
-    file.write_all(&salt)?;
+    file.write_all(&keys.salt)?;
     file.write_all(&iv)?;
     file.write_all(ciphertext)?;
     Ok(())
 }
 
-fn save_encrypted_db(db: &HashMap<String, (String, String)>, password: &str) -> Result<()> {
+fn save_encrypted_db_with_key(
+    db: &HashMap<String, (String, String)>,
+    keys: &DerivedKeys,
+) -> Result<()> {
     let mut content = String::new();
     for (uuid, (hash, time)) in db {
         content.push_str(&format!("{} {} {}\n", uuid, hash, time));
     }
-    save_to_encrypted_file(DB_FILENAME, content.as_bytes(), password)?;
+    save_to_encrypted_file_with_key(DB_FILENAME, content.as_bytes(), keys)?;
     Ok(())
 }
 
